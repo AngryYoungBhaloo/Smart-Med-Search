@@ -10,7 +10,7 @@ from elasticsearch import Elasticsearch, helpers
 ##############################
 
 # OpenAI API key
-openai.api_key = "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" 
+openai.api_key = #ADD YOUR OWN KEY
 
 
 es = Elasticsearch("http://localhost:9200", basic_auth=("elastic", "changeme"))

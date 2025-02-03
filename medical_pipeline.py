@@ -1,63 +1,63 @@
-#medical_pipeline.py
 #!/usr/bin/env python3
 """
 medical_pipeline.py
 
 This script does the following:
-1. Connects to Elasticsearch (which must be running on localhost:9200 with basic_auth "elastic"/"changeme").
-2. Creates (or uses) an index named "medical-terms-index" to store terms, embeddings, and classification.
-3. Reads terms from 'wordlist.txt' (one term per line).
-4. Fetches embeddings for each new (not-yet-indexed) term from OpenAI model "text-embedding-3-large".
-5. Checks if a new term is a near-duplicate (cosine similarity >= 0.98). If so, it is skipped.
-6. Indexes all unique terms with their embeddings.
-7. Classifies all unclassified terms in small batches using OpenAI chat model "gpt-4o-mini".
-   The categories are more granular, e.g. "Disease or Syndrome", "Symptom or Sign", etc.
-8. Exports the final set of documents (term, embedding, classification) to a CSV named "final_medical_terms.csv".
 
-The script is designed to pick up where it left off:
-- If the index already has some terms, it won't embed them again.
-- If a term is already classified, it won't re-classify it.
-Hence you can safely re-run the script if it ever fails mid-way.
+1. Connects to Elasticsearch ("localhost:9200", basic_auth: "elastic"/"changeme").
+2. (Re)creates an index named "medical-terms-index" to store terms, embeddings, context, classification.
+3. Loads terms from 'wordlist.txt' (one term per line).
+4. Merges these terms with the sanitized GPT cache (from gpt4omini_cache_sanitized.json).
+5. If RUN_GPT=True, calls GPT 4o-mini for any terms missing from the cache. 
+   (But if you already have them all in the cache, it won't re-call GPT.)
+6. Creates text+context embeddings. 
+7. Deduplicates the embeddings at a high threshold (e.g., 0.995) so near-identical items collapse to one record.
+8. Exports all final docs to a CSV.
+
+You can skip GPT classification entirely (RUN_GPT=False) if the cache is already complete.
 """
 
 import os
 import time
 import json
-from openai import OpenAI
-from dotenv import load_dotenv
+import re
+import math
 import pandas as pd
 from tqdm import tqdm
 from datetime import datetime
+from dotenv import load_dotenv
 from elasticsearch import Elasticsearch, helpers
+from openai import OpenAI
 
-###############################################################################
-# PART 1: CONFIG & CONSTANTS
-###############################################################################
+# -------------------- CONFIG ----------------------------------
 
-# ========== DOCKER/ELASTICSEARCH SETTINGS ==========
-ES_HOST = "http://localhost:9200"     # Where Elasticsearch is listening
-ES_USER = "elastic"                   # Basic auth user
-ES_PASS = "changeme"                  # Basic auth password
+RUN_GPT = False  # Set to False if you do NOT want to call GPT at all. 
+                 # (Use the sanitized cache only.)
+
+ES_HOST = "http://localhost:9200"
+ES_USER = "elastic"
+ES_PASS = "changeme"
 INDEX_NAME = "medical-terms-index"
 
-# ========== OPENAI SETTINGS ==========
 load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-
 client = OpenAI(api_key=OPENAI_API_KEY)
-EMBED_MODEL = "text-embedding-3-large"   # 3072 dims
-CLASSIFICATION_MODEL = "gpt-4o-mini"     # do not rename
 
-# ========== EMBEDDINGS/DEDUP OPTIONS ==========
+EMBED_MODEL = "text-embedding-3-large"  # 3072 dimensions
+CLASSIFICATION_MODEL = "gpt-4o-mini"    # We won't call it if RUN_GPT=False
+
 EMBED_DIM = 3072
 BATCH_SIZE = 50
-DEDUP_THRESHOLD = 0.98  # Cosine similarity threshold to consider near-duplicate
 
-# ========== FILE INPUT/OUTPUT ==========
+# If you want to make the dedup threshold stricter (so that almost identical items are removed),
+# raise it closer to 1.0. 
+DEDUP_THRESHOLD = 0.995  
+
 WORDLIST_FILE = "wordlist.txt"
 OUTPUT_CSV = "final_medical_terms.csv"
+SANITIZED_CACHE_FILE = "gpt4omini_cache_sanitized.json"
 
-# ========== CATEGORIES FOR CLASSIFICATION (GRANULAR) ==========
+# -------------------- Categories ----------------------------------
 CATEGORIES = [
     "Disease or Syndrome",
     "Symptom or Sign",
@@ -82,19 +82,17 @@ CATEGORIES = [
     "Other"
 ]
 
-###############################################################################
-# PART 2: ELASTICSEARCH SETUP
-###############################################################################
+# -------------------- ES Setup ----------------------------------
 
-# Create Elasticsearch client
 es = Elasticsearch(ES_HOST, basic_auth=(ES_USER, ES_PASS))
 
-def create_index_if_not_exists():
-    """Creates the medical-terms-index if it doesn't already exist,
-    mapping for 'term', 'embedding' (dense_vector), and 'classification'."""
+def recreate_index():
+    """
+    Deletes the old index if it exists, and creates a fresh one with the desired mapping.
+    """
     if es.indices.exists(index=INDEX_NAME):
-        print(f"Index '{INDEX_NAME}' already exists; will use it as-is.")
-        return
+        print(f"Deleting existing index '{INDEX_NAME}'...")
+        es.indices.delete(index=INDEX_NAME)
     print(f"Creating new index '{INDEX_NAME}'...")
     index_body = {
         "settings": {
@@ -104,6 +102,7 @@ def create_index_if_not_exists():
         "mappings": {
             "properties": {
                 "term": {"type": "keyword"},
+                "context": {"type": "text"},
                 "embedding": {"type": "dense_vector", "dims": EMBED_DIM},
                 "classification": {"type": "keyword"}
             }
@@ -112,209 +111,10 @@ def create_index_if_not_exists():
     es.indices.create(index=INDEX_NAME, body=index_body)
     print(f"Index '{INDEX_NAME}' created.")
 
-###############################################################################
-# PART 3: READ WORDLIST & PREP
-###############################################################################
-
-def load_wordlist():
-    """Loads unique terms from wordlist.txt, stripping empty lines."""
-    if not os.path.exists(WORDLIST_FILE):
-        print(f"Error: Could not find {WORDLIST_FILE} in current directory.")
-        return []
-    with open(WORDLIST_FILE, "r", encoding="utf-8") as f:
-        terms = [line.strip() for line in f if line.strip()]
-    terms = list(set(terms))  # remove duplicates in the file
-    print(f"Loaded {len(terms)} unique terms from '{WORDLIST_FILE}'.")
-    return terms
-
-def already_in_index(term):
-    """Check if a term doc exists in the index, by ID or a direct match."""
-    try:
-        doc = es.get(index=INDEX_NAME, id=term)
-        return doc["found"]
-    except:
-        return False
-
-###############################################################################
-# PART 4: EMBEDDING + DEDUP
-###############################################################################
-
-def embed_batch(terms_batch):
-    """Get embeddings for a batch of terms from OpenAI Embeddings API."""
-    response = client.embeddings.create(
-        input=terms_batch,
-        model=EMBED_MODEL
-    )
-    # The embeddings come back in the same order as input
-    return [item.embedding for item in response.data]
-
-def is_near_duplicate(embedding):
-    """
-    Query Elasticsearch for top 3 similar docs.
-    If any doc has cosSim >= DEDUP_THRESHOLD, it's a near-duplicate.
-    """
-    query_body = {
-        "size": 3,
-        "query": {
-            "script_score": {
-                "query": {"match_all": {}},
-                "script": {
-                    "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
-                    "params": {"query_vector": embedding}
-                }
-            }
-        }
-    }
-    resp = es.search(index=INDEX_NAME, body=query_body)
-    for h in resp["hits"]["hits"]:
-        # _score = cosSim + 1
-        cos_sim = h["_score"] - 1.0
-        if cos_sim >= DEDUP_THRESHOLD:
-            return True
-    return False
-
-def embed_and_index_terms(all_terms):
-    """
-    For all terms in wordlist, if not already in index, embed them in small batches,
-    check near-duplicate, and index if unique. Classification is left blank initially.
-    """
-    to_process = [t for t in all_terms if not already_in_index(t)]
-    if not to_process:
-        print("No new terms to embed. Skipping embedding step.")
-        return
-    
-    print(f"Embedding and indexing {len(to_process)} new terms with dedup check...")
-    for i in tqdm(range(0, len(to_process), BATCH_SIZE)):
-        batch_terms = to_process[i : i + BATCH_SIZE]
-        embeddings = embed_batch(batch_terms)
-        
-        # We'll store each doc if it isn't a near-duplicate
-        ops = []
-        for term_str, emb in zip(batch_terms, embeddings):
-            if not is_near_duplicate(emb):
-                ops.append({
-                    "_index": INDEX_NAME,
-                    "_id": term_str,
-                    "_source": {
-                        "term": term_str,
-                        "embedding": emb,
-                        "classification": ""  # blank for now
-                    }
-                })
-        if ops:
-            helpers.bulk(es, ops)
-    print("Done embedding and storing to Elasticsearch with dedup.")
-
-###############################################################################
-# PART 5: CLASSIFICATION
-###############################################################################
-
-def fetch_unclassified_docs(batch_size=50):
-    """Returns a batch of docs with classification = '' (still unclassified)."""
-    body = {
-        "query": {
-            "term": {"classification": ""}
-        },
-        "size": batch_size
-    }
-    return es.search(index=INDEX_NAME, body=body)
-
-def classify_terms_batch(terms_batch):
-    """Call OpenAI ChatCompletion to classify each term into exactly one of the categories."""
-    # Build the prompt with granular categories
-    cats_str = ", ".join(CATEGORIES)
-    prompt = (f"Classify each term into EXACTLY one of the following categories:\n"
-              f"[{cats_str}].\n\n")
-    for t in terms_batch:
-        prompt += f"Term: {t}\n"
-    prompt += (
-        "\nOutput JSON lines, each line => {\"term\": \"<term>\", \"category\": \"<one_of_the_list>\"}.\n"
-    )
-
-    try:
-        response = client.chat.completions.create(
-        model=CLASSIFICATION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-    except Exception as e:
-        print(f"Error calling OpenAI classification: {str(e)}")
-        # If there's an API error, fallback to all "Other" classification
-        return {term: "Other" for term in terms_batch}
-
-    content = response.choices[0].message.content.strip()
-    # In case the response has code fences
-    content = content.replace("```json", "").replace("```", "").strip()
-
-    class_map = {}
-    for line in content.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            j = json.loads(line)
-            class_map[j["term"]] = j["category"]
-        except:
-            # If parse fails for a line, fallback
-            pass
-
-    # Default to "Other" if not parsed
-    for t in terms_batch:
-        if t not in class_map:
-            class_map[t] = "Other"
-
-    return class_map
-
-def classify_unclassified():
-    """
-    Loops over unclassified docs in small batches.
-    Classifies them and updates them in Elasticsearch.
-    Respects progress so if re-run, it won't re-classify anything that already has classification.
-    """
-    print("Classifying terms in batches. This may take a while...")
-
-    total_unclassified = es.count(index=INDEX_NAME, body={
-        "query": {"term": {"classification": ""}}
-    })["count"]
-    if total_unclassified == 0:
-        print("No unclassified terms found. Skipping classification.")
-        return
-
-    pbar = tqdm(total=total_unclassified, desc="Classifying", unit="term")
-    while True:
-        res = fetch_unclassified_docs()
-        hits = res["hits"]["hits"]
-        if not hits:
-            break  # no more unclassified docs
-
-        chunk_terms = [h["_source"]["term"] for h in hits]
-        c_map = classify_terms_batch(chunk_terms)
-
-        update_ops = []
-        for h in hits:
-            term_str = h["_source"]["term"]
-            cat = c_map.get(term_str, "Other")
-            update_ops.append({
-                "_op_type": "update",
-                "_index": INDEX_NAME,
-                "_id": term_str,
-                "doc": {"classification": cat}
-            })
-        if update_ops:
-            helpers.bulk(es, update_ops)
-            pbar.update(len(update_ops))
-
-        # small pause to avoid hitting rate limits
-        time.sleep(1)
-    pbar.close()
-    print("Classification complete.")
-
-###############################################################################
-# PART 6: EXPORT TO CSV
-###############################################################################
-
 def fetch_all_docs(chunk_size=1000):
-    """Scroll through all docs in the index, returning a list of dicts."""
+    """
+    Scroll through all docs in the index, returning a list of dicts.
+    """
     data = []
     resp = es.search(
         index=INDEX_NAME,
@@ -330,6 +130,7 @@ def fetch_all_docs(chunk_size=1000):
             data.append({
                 "id": h["_id"],
                 "term": src["term"],
+                "context": src["context"],
                 "embedding": src["embedding"],
                 "classification": src["classification"]
             })
@@ -340,34 +141,245 @@ def fetch_all_docs(chunk_size=1000):
     return data
 
 def export_csv():
-    """Fetch all docs from ES and export to 'final_medical_terms.csv'."""
+    """
+    Fetch all docs from ES and export to OUTPUT_CSV.
+    """
     print("Fetching all documents for export...")
     all_docs = fetch_all_docs()
     df = pd.DataFrame(all_docs)
     df.to_csv(OUTPUT_CSV, index=False)
     print(f"Exported {len(df)} documents to '{OUTPUT_CSV}'.")
 
-###############################################################################
-# MAIN
-###############################################################################
+# -------------------- Load Wordlist & Cache ---------------------
+
+def load_wordlist():
+    """
+    Load unique terms from wordlist.txt. If not found, return empty.
+    """
+    if not os.path.exists(WORDLIST_FILE):
+        print(f"Warning: {WORDLIST_FILE} not found, proceeding without it.")
+        return []
+    with open(WORDLIST_FILE, "r", encoding="utf-8") as f:
+        terms = [line.strip() for line in f if line.strip()]
+    terms = list(set(terms))
+    print(f"Loaded {len(terms)} unique terms from '{WORDLIST_FILE}'.")
+    return terms
+
+def load_sanitized_cache():
+    """
+    Load the sanitized cache file (gpt4omini_cache_sanitized.json).
+    """
+    if not os.path.exists(SANITIZED_CACHE_FILE):
+        print(f"Error: {SANITIZED_CACHE_FILE} not found. Run sanitize_cache.py first.")
+        return {}
+    with open(SANITIZED_CACHE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_gpt_cache(cache_dict):
+    """
+    (Optional) Save the updated GPT data if we do new classification.
+    """
+    with open(SANITIZED_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache_dict, f, indent=2, ensure_ascii=False)
+
+# -------------------- GPT classification (optional) ------------
+
+def classify_terms_batch_with_context(terms_batch):
+    """
+    Calls GPT 4o-mini to get context+classification for each term.
+    If GPT fails, fallback to {context:"", classification:"Other"} for that term.
+    """
+    cats_str = ", ".join(CATEGORIES)
+    prompt = (
+        "For the given medical term, provide the following information using only key words:\n"
+        "1) Brief definition\n2) Synonyms\n3) Typical use-case info (depending on category)\n"
+        "Return JSON with these keys exactly: \"term\", \"context\", \"classification\".\n"
+        f"Classification must be one of [{cats_str}].\n\n"
+        "Format: {\"term\": \"...\", \"context\": \"...\", \"classification\": \"...\"}\n"
+        "Here are the terms:\n"
+    )
+    for t in terms_batch:
+        prompt += f"Term: {t}\n"
+
+    try:
+        response = client.chat.completions.create(
+            model=CLASSIFICATION_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        content = response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Error calling GPT 4o-mini: {e}")
+        # fallback
+        return {t: {"context": "", "classification": "Other"} for t in terms_batch}
+
+    # parse the lines of JSON
+    results = {}
+    lines = content.split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # remove code fences if any
+        line = line.replace("```json", "").replace("```", "").strip()
+        try:
+            j = json.loads(line)
+            term_val = j.get("term", "").strip()
+            ctx_val = j.get("context", "").strip()
+            cls_val = j.get("classification", "").strip()
+            if term_val:
+                results[term_val] = {
+                    "context": ctx_val,
+                    "classification": cls_val
+                }
+        except Exception as parse_ex:
+            print(f"Failed to parse line: {line} | Error: {parse_ex}")
+
+    return results
+
+def classify_missing_terms(cache_data, all_terms):
+    """
+    If RUN_GPT=True, call GPT for any terms not in cache_data. 
+    Otherwise, do nothing.
+    """
+    if not RUN_GPT:
+        print("RUN_GPT=False, skipping GPT calls.")
+        return cache_data
+
+    # find which terms are missing from the cache
+    missing_terms = [t for t in all_terms if t not in cache_data]
+    if not missing_terms:
+        print("No missing terms in the cache. Skipping GPT calls.")
+        return cache_data
+
+    print(f"Classifying {len(missing_terms)} missing terms via GPT 4o-mini...")
+    results = {}
+    for i in tqdm(range(0, len(missing_terms), BATCH_SIZE)):
+        batch = missing_terms[i : i + BATCH_SIZE]
+        batch_res = classify_terms_batch_with_context(batch)
+        results.update(batch_res)
+        # merge into cache_data
+        for k, v in batch_res.items():
+            cache_data[k] = v
+        save_gpt_cache(cache_data)
+        time.sleep(1)  # prevent rate-limit issues
+
+    print("Done classifying missing terms.")
+    return cache_data
+
+# -------------------- Embedding + Dedup on text+context --------
+
+def embed_batch(texts_batch):
+    """
+    Get embeddings for a batch of texts from the OpenAI embedding API.
+    Returns a list of float[] vectors in the same order.
+    """
+    response = client.embeddings.create(
+        input=texts_batch,
+        model=EMBED_MODEL
+    )
+    return [d.embedding for d in response.data]
+
+def is_near_duplicate(embedding):
+    """
+    Query Elasticsearch for the top 3 similar docs using text+context embeddings,
+    and see if any has cosine similarity >= DEDUP_THRESHOLD.
+    """
+    query_body = {
+        "size": 3,
+        "query": {
+            "script_score": {
+                "query": {"match_all": {}},
+                "script": {
+                    "source": "cosineSimilarity(params.query_vector, 'embedding') + 1.0",
+                    "params": {"query_vector": embedding}
+                }
+            }
+        }
+    }
+    resp = es.search(index=INDEX_NAME, body=query_body)
+    for hit in resp["hits"]["hits"]:
+        cos_sim = hit["_score"] - 1.0
+        if cos_sim >= DEDUP_THRESHOLD:
+            return True
+    return False
+
+def embed_and_deduplicate_terms(final_data):
+    """
+    final_data is a list of dicts:
+      [
+        { "term": <str>, "context": <str>, "classification": <str> },
+        ...
+      ]
+    We embed "term + context", deduplicate at DEDUP_THRESHOLD, and store them in Elasticsearch.
+    """
+    print(f"Embedding {len(final_data)} items and deduplicating with threshold={DEDUP_THRESHOLD}...")
+
+    processed_count = 0
+    to_upload = []
+
+    for i in tqdm(range(0, len(final_data), BATCH_SIZE)):
+        batch = final_data[i : i + BATCH_SIZE]
+        texts_batch = [(d["term"] + " " + d["context"]).strip() for d in batch]
+        embeddings = embed_batch(texts_batch)
+
+        for (item, emb) in zip(batch, embeddings):
+            if not is_near_duplicate(emb):
+                # not a near-duplicate, so we'll store it
+                op = {
+                    "_index": INDEX_NAME,
+                    "_id": item["term"],  # or you could do a unique ID
+                    "_source": {
+                        "term": item["term"],
+                        "context": item["context"],
+                        "classification": item["classification"],
+                        "embedding": emb
+                    }
+                }
+                to_upload.append(op)
+        if to_upload:
+            helpers.bulk(es, to_upload)
+            to_upload.clear()
+        processed_count += len(batch)
+
+    print(f"Done. Processed {processed_count} items (some deduplicated).")
+
+# -------------------- MAIN FLOW -------------------------
 
 def main():
-    # 1. Create index if needed
-    create_index_if_not_exists()
+    # 1) Re-create the ES index from scratch (delete old)
+    recreate_index()
 
-    # 2. Load wordlist
-    all_terms = load_wordlist()
-    if not all_terms:
-        print("No terms found. Exiting.")
-        return
+    # 2) Load wordlist
+    wordlist_terms = load_wordlist()
 
-    # 3. Embed + Index Terms (skip those already in index)
-    embed_and_index_terms(all_terms)
+    # 3) Load the sanitized cache
+    cache_data = load_sanitized_cache()
 
-    # 4. Classify any unclassified docs
-    classify_unclassified()
+    # 4) Combine wordlist + cache keys, so we embed everything
+    all_terms = set(wordlist_terms).union(set(cache_data.keys()))
+    all_terms = list(all_terms)
+    print(f"Total terms after merging wordlist & cache: {len(all_terms)}")
 
-    # 5. Export to CSV
+    # 5) If RUN_GPT=True, classify missing terms 
+    #    (But if RUN_GPT=False, skip GPT calls)
+    cache_data = classify_missing_terms(cache_data, all_terms)
+
+    # 6) Build the final list of term-data from the cache
+    #    If something is not in the cache, fallback classification = "Other"
+    final_data = []
+    for t in all_terms:
+        info = cache_data.get(t, {"context":"", "classification":"Other"})
+        final_data.append({
+            "term": t,
+            "context": info["context"],
+            "classification": info["classification"]
+        })
+
+    # 7) Embed + Deduplicate on text+context
+    embed_and_deduplicate_terms(final_data)
+
+    # 8) Export to CSV
     export_csv()
 
 if __name__ == "__main__":

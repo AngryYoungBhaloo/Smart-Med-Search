@@ -1,3 +1,4 @@
 .env
 final_medical_terms.csv
 venv/
+gpt4omini_cache_old.json

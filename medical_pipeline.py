@@ -304,6 +304,18 @@ def is_near_duplicate(embedding):
             return True
     return False
 
+def doc_exists(term):
+    """
+    Returns True if Elasticsearch already has a doc with _id == term,
+    otherwise False.
+    """
+    try:
+        doc = es.get(index=INDEX_NAME, id=term)
+        return doc["found"]
+    except Exception:
+        return False
+
+
 def embed_and_deduplicate_terms(final_data):
     """
     final_data is a list of dicts:
@@ -311,39 +323,55 @@ def embed_and_deduplicate_terms(final_data):
         { "term": <str>, "context": <str>, "classification": <str> },
         ...
       ]
-    We embed "term + context", deduplicate at DEDUP_THRESHOLD, and store them in Elasticsearch.
+
+    We embed "term + context", deduplicate at DEDUP_THRESHOLD,
+    and only insert new docs (skip any doc that already exists in ES).
     """
     print(f"Embedding {len(final_data)} items and deduplicating with threshold={DEDUP_THRESHOLD}...")
-
     processed_count = 0
-    to_upload = []
 
     for i in tqdm(range(0, len(final_data), BATCH_SIZE)):
         batch = final_data[i : i + BATCH_SIZE]
-        texts_batch = [(d["term"] + " " + d["context"]).strip() for d in batch]
-        embeddings = embed_batch(texts_batch)
 
-        for (item, emb) in zip(batch, embeddings):
+        # Separate docs that are already in ES (we skip these)
+        new_docs = []
+        for d_item in batch:
+            if not doc_exists(d_item["term"]):
+                new_docs.append(d_item)
+
+        # If entire batch is already in ES, just mark them processed
+        if not new_docs:
+            processed_count += len(batch)
+            continue
+
+        # Build the texts for embedding
+        texts_batch = [(x["term"] + " " + x["context"]).strip() for x in new_docs]
+        embeddings = embed_batch(texts_batch)  # your existing embed_batch()
+
+        to_upload = []
+        for (d_item, emb) in zip(new_docs, embeddings):
+            # Check near-duplicate
             if not is_near_duplicate(emb):
-                # not a near-duplicate, so we'll store it
                 op = {
                     "_index": INDEX_NAME,
-                    "_id": item["term"],  # or you could do a unique ID
+                    "_id": d_item["term"],  # or you could pick a unique ID
                     "_source": {
-                        "term": item["term"],
-                        "context": item["context"],
-                        "classification": item["classification"],
+                        "term": d_item["term"],
+                        "context": d_item["context"],
+                        "classification": d_item["classification"],
                         "embedding": emb
                     }
                 }
                 to_upload.append(op)
+
         if to_upload:
             helpers.bulk(es, to_upload)
-            to_upload.clear()
+
         processed_count += len(batch)
 
-    print(f"Done. Processed {processed_count} items (some deduplicated).")
+    print(f"Done. Processed {processed_count} items in total batches (skipped & deduped included).")
 
+    
 # -------------------- MAIN FLOW -------------------------
 
 def main():

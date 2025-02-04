@@ -1,4 +1,6 @@
 .env
 final_medical_terms.csv
 venv/
-gpt4omini_cache_old.json.DS_Store
+gpt4omini_cache.json
+gpt4omini_cache_sanitized.json
+.DS_Store
